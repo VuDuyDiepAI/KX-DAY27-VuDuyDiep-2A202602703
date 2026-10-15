@@ -1,6 +1,6 @@
 """Exercise 3 — Escalation branch with reviewer Q&A.
 
-When confidence < 60%, the agent doesn't ask approve/reject — it asks specific
+When confidence < 58%, the agent doesn't ask approve/reject — it asks specific
 clarifying questions and then synthesizes a refined review from the answers.
 """
 
@@ -13,7 +13,6 @@ from dotenv import load_dotenv
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
-from rich.console import Console
 from rich.panel import Panel
 
 from common.github import fetch_pr, post_review_comment
@@ -21,12 +20,16 @@ from common.llm import get_llm
 from common.schemas import (
     AUTO_APPROVE_THRESHOLD,
     ESCALATE_THRESHOLD,
-    PRAnalysis,
     ReviewState,
+)
+from exercises.exercise_2_hitl import prompt_human
+from exercises.review_helpers import (
+    analysis_messages, checkpoint_serializer, make_console, structured_review,
+    synthesis_messages, validate_answers, validate_approval,
 )
 
 
-console = Console()
+console = make_console()
 
 
 def node_fetch_pr(state):
@@ -39,16 +42,9 @@ def node_fetch_pr(state):
 
 def node_analyze(state):
     console.print("[cyan]→ analyze[/cyan]")
-    llm = get_llm().with_structured_output(PRAnalysis)
+    llm = structured_review(get_llm())
     with console.status("[dim]LLM reviewing the diff...[/dim]"):
-        analysis = llm.invoke([
-            {"role": "system", "content": (
-                "Senior reviewer. Structured output. "
-                # TODO: add an instruction: if confidence < 60%, populate escalation_questions
-                # with 2–4 specific, context-rich questions (reference which file/section in the diff).
-            )},
-            {"role": "user", "content": f"Title: {state['pr_title']}\nDiff:\n{state['pr_diff']}"},
-        ])
+        analysis = llm.invoke(analysis_messages(state))
     console.print(f"  [green]✓[/green] confidence={analysis.confidence:.0%}, {len(analysis.escalation_questions)} question(s)")
     return {"analysis": analysis}
 
@@ -71,22 +67,20 @@ def node_escalate(state: ReviewState) -> dict:
         # fallback when the LLM didn't generate any questions
         questions = ["What is the intent of this PR?", "Any migration concerns?"]
 
-    # TODO: call interrupt(payload) where payload kind="escalation" contains:
-    #       pr_url, confidence, confidence_reasoning, summary, risk_factors, questions.
-    # answers = interrupt({...})
-    # return {"escalation_answers": answers}
-    raise NotImplementedError("Call interrupt() with an escalation payload")
+    answers = interrupt({
+        "kind": "escalation", "pr_url": state["pr_url"],
+        "confidence": a.confidence, "confidence_reasoning": a.confidence_reasoning,
+        "summary": a.summary, "risk_factors": a.risk_factors, "questions": questions,
+    })
+    return {"escalation_answers": validate_answers(answers, questions)}
 
 
 def node_synthesize(state: ReviewState) -> dict:
     """Re-prompt LLM with the reviewer's answers and produce a refined review."""
-    # TODO:
-    #   - read state["escalation_answers"] (dict[question, answer])
-    #   - call get_llm().with_structured_output(PRAnalysis).invoke(...) with a prompt
-    #     containing the original diff + initial analysis + Q&A.
-    #   - return {"analysis": refined}
-    # `node_commit` will then post the refined review to the PR.
-    raise NotImplementedError("Synthesize a refined PRAnalysis using the reviewer answers")
+    llm = structured_review(get_llm())
+    with console.status("[dim]LLM refining review with reviewer answers...[/dim]"):
+        refined = llm.invoke(synthesis_messages(state))
+    return {"analysis": refined}
 
 
 def node_human_approval(state):
@@ -98,7 +92,7 @@ def node_human_approval(state):
         "comments": [c.model_dump() for c in a.comments],
         "diff_preview": state["pr_diff"][:2000],
     })
-    return {"human_choice": response.get("choice"), "human_feedback": response.get("feedback")}
+    return validate_approval(response)
 
 
 def _render_comment_body(state) -> str:
@@ -161,27 +155,29 @@ def build_graph():
     g.add_edge("auto_approve", END)
     g.add_edge("human_approval", "commit")
     g.add_edge("commit", END)
-    # TODO: wire escalate → synthesize → commit  (commit already → END)
-    return g.compile(checkpointer=MemorySaver())
+    g.add_edge("escalate", "synthesize")
+    g.add_edge("synthesize", "commit")
+    return g.compile(checkpointer=MemorySaver(serde=checkpoint_serializer()))
 
 
 def handle_interrupt(payload):
     kind = payload["kind"]
     if kind == "approval_request":
-        console.print(Panel.fit(
-            payload["summary"],
-            title=f"Approve? conf={payload['confidence']:.0%}",
-            border_style="green",
-        ))
-        choice = console.input("approve/reject/edit? ").strip().lower()
-        return {"choice": choice, "feedback": console.input("Feedback: ").strip()}
+        return prompt_human(payload)
     if kind == "escalation":
         console.print(Panel.fit(
-            payload["summary"],
+            f"{payload['summary']}\n\n{payload['confidence_reasoning']}\n\n"
+            + "\n".join(f"• {risk}" for risk in payload.get("risk_factors", [])),
             title=f"Escalation conf={payload['confidence']:.0%}",
             border_style="yellow",
         ))
-        return {q: console.input(f"Q: {q}\nA: ").strip() for q in payload["questions"]}
+        answers = {}
+        for question in payload["questions"]:
+            answer = ""
+            while not answer:
+                answer = console.input(f"Q: {question}\nA: ").strip()
+            answers[question] = answer
+        return answers
     raise ValueError(kind)
 
 
